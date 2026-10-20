@@ -24,6 +24,9 @@ development on macOS. LiteTracker still performs frame-by-frame point tracking.
   IDs across sessions; lost points are left behind at the boundary.
 - **Inspection and tests:** solid point markers, per-frame JSONL logs, summary
   timings, and tests cover insertion, retention, and the keyframe policy.
+- **ONNX integration:** the same managed wrapper works over the upstream hybrid
+  ONNX backend; the demo supports `--onnx-dir` and export verification exercises
+  query insertion and session boundaries.
 - **Mac development:** platform-specific dependencies and MPS execution with CPU
   fallback for unsupported operations; see the setup instructions below.
 
@@ -200,8 +203,92 @@ tracking, the controller, keyframe reinitialization, and device synchronization;
 it excludes decoding and rendering. This differs from the older `tracker_ms`,
 which excluded controller/insertion costs. Mac uses MPS with CPU fallback.
 
-Query management stays outside an eventual ONNX/TensorRT graph. A backend cache
-adapter/export and numerical validation are still required for those runtimes.
+### Using the managed wrapper with ONNX
+
+The upstream `OnnxLiteTracker` class in `onnx_example.py` remains the ONNX backend.
+This fork connects it to `ManagedLiteTracker` and extends export verification.
+The original constructor arguments and legacy export folders containing only the
+three ONNX files remain supported. New exports additionally store configuration
+and the time embedding so the backend can load the exact exported settings.
+Explicit constructor settings that conflict with that metadata are rejected.
+
+The responsibilities are:
+
+| Part | Runs where | Responsibility |
+| --- | --- | --- |
+| VSLAM / demo `TrackingController` | Python host | Decide when to create keyframes and which points to carry/add |
+| `ManagedLiteTracker` | Python host | Stable IDs, absolute frame clock, query insertion, session handovers |
+| `OnnxLiteTracker` | CPU PyTorch + ONNX Runtime | Preprocess frames, sample features, keep caches, invoke neural components |
+| `fnet.onnx`, `corr_mlp.onnx`, `updateformer.onnx` | ONNX Runtime | Feature extraction, correlation compression, neural track updates |
+
+This is a **hybrid backend**, not a single exported tracker graph. It still
+requires PyTorch for resizing, sampling and state operations. Neural inference
+uses ONNX Runtime; on Mac the managed demo explicitly uses CPUExecutionProvider.
+GPU providers and TensorRT have not been validated by this work. The ONNX backend
+expects CPU float32 input tensors; `.to("mps")` is not an ONNX runtime selector.
+
+1. Export and verify with the existing weights (`weights/onnx_managed` is also
+   the default export directory):
+
+   ```bash
+   uv run onnx_example.py --checkpoint weights/scaled_online.pth \
+     --output_dir weights/onnx_managed --verify
+   ```
+
+   Export produces the three ONNX graphs plus `tracker_config.json` and
+   `time_emb.npy`. The verifier compares both backends through the same managed
+   wrapper: future query births, changing point counts, the full 16-frame window,
+   a keyframe handover, an empty session, and a new-video reset. Coordinate,
+   confidence, visibility, IDs and clocks are checked. Failures return a nonzero
+   exit status; `results/<bundle-name>/verification.json` records the results
+   (`results/onnx_managed/verification.json` for these commands). The default 36 frames
+   exercise the full lifecycle; shorter explicitly requested runs report partial
+   coverage. Use `--verify-only` to check an existing export without re-exporting.
+
+2. Run the same managed demo with ONNX:
+
+   ```bash
+   uv run managed_demo.py --video assets/stir-5-seq-01.mp4 \
+     --onnx-dir weights/onnx_managed --device cpu --max-frames 80 \
+     --output results/managed_onnx_check
+   ```
+
+   `--onnx-dir` selects the ONNX backend instead of `--checkpoint`. Keyframe rules,
+   drawing and logs use the same controller and wrapper. The summary records the
+   selected backend. Exported models and their configuration stay under
+   `weights/onnx_managed/`; videos and verification reports stay under `results/`.
+   Both directories are ignored by Git.
+
+3. In an application, compose the existing backend and wrapper:
+
+   ```python
+   from onnx_example import OnnxLiteTracker
+   from src.managed_lite_tracker import ManagedLiteTracker
+
+   backend = OnnxLiteTracker("weights/onnx_managed", providers=["CPUExecutionProvider"])
+   tracker = ManagedLiteTracker(backend, max_points=512)
+   coords, visible, confidence = tracker(frame.cpu().float(), queries.cpu().float())
+   # Later: tracker(next_frame.cpu().float())
+   # At a keyframe: tracker.start_keyframe(keep_ids, new_points.cpu().float())
+   ```
+
+On each normal frame, the host invokes the same three ONNX sessions while keeping
+history between calls. At a keyframe, the wrapper resets the backend's **tracking
+state**, then primes it on the same image with carried/new queries. It does not
+reload, re-export or recreate the ONNX sessions. The graph supports changing point
+counts and temporal window lengths, so query changes do not require a new export.
+
+Validation on this Mac used CPU float32 execution. The 36-frame synthetic
+lifecycle check passed the strict 0.01-pixel coordinate and 0.001 confidence
+limits with exact visibility agreement. An independent 80-frame real-video run
+with 100 points per session produced identical IDs, visibility and keyframe
+choices. Recurrent numerical differences reached 0.278 pixels across all points
+and 0.047 pixels among visible points; that real run exceeded the strict synthetic
+numeric limits and is not bit-identical. With identical history supplied before
+each frame as a diagnostic, the largest per-axis discrepancy was 0.000245 pixels,
+consistent with small numerical differences accumulating through the recurrent
+state. These checks establish tested behaviour, not accuracy against ground truth
+or a guarantee that arbitrarily long trajectories make identical decisions.
 
 ### Demo and runtime analysis
 The demo script runs LiteTracker on a video in a stream-line fashion, produces a video with tracking results, and prints the runtime statistics.

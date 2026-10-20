@@ -291,7 +291,11 @@ def synchronize(device):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--video", required=True)
-    parser.add_argument("--checkpoint", default="weights/scaled_online.pth")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--checkpoint", default="weights/scaled_online.pth")
+    source.add_argument(
+        "--onnx-dir", help="Use exported ONNX components with CPU orchestration."
+    )
     parser.add_argument("--output", default="results/managed")
     parser.add_argument(
         "--device", choices=["auto", "cpu", "mps", "cuda"], default="auto"
@@ -332,6 +336,10 @@ def main():
         patience=args.kf_patience,
     )
     device = args.device
+    if args.onnx_dir:
+        if device not in ("auto", "cpu"):
+            parser.error("The hybrid ONNX demo requires --device cpu (or auto).")
+        device = "cpu"
     if device == "auto":
         device = (
             "cuda"
@@ -341,10 +349,16 @@ def main():
             else "cpu"
         )
     torch.set_num_threads(2)
-    model = LiteTracker()
-    weights = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    model.load_state_dict(weights.get("model", weights))
-    tracker = ManagedLiteTracker(model.to(device).eval(), max_points=args.max_points)
+    if args.onnx_dir:
+        from onnx_example import OnnxLiteTracker
+
+        model = OnnxLiteTracker(args.onnx_dir, providers=["CPUExecutionProvider"])
+    else:
+        model = LiteTracker()
+        weights = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        model.load_state_dict(weights.get("model", weights))
+        model = model.to(device).eval()
+    tracker = ManagedLiteTracker(model, max_points=args.max_points)
     cap = cv2.VideoCapture(args.video)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {args.video}")
@@ -431,6 +445,7 @@ def main():
     summary = dict(
         video=str(Path(args.video).resolve()),
         device=device,
+        backend="onnxruntime" if args.onnx_dir else "pytorch",
         frames=len(timings),
         model_resolution_hw=list(model.model_resolution),
         input_resolution_hw=[h, w],

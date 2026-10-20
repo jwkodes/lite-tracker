@@ -1,8 +1,28 @@
 """Point lifecycle operations around LiteTracker; no mapping or pose policy."""
 
+from typing import Protocol
+
 import torch
 
-from src.lite_tracker import LiteTracker
+
+class TrackerBackend(Protocol):
+    """State contract; backend caches hold tensors after the first inference."""
+
+    online_ind: int
+    stride: int
+    model_resolution: tuple[int, int]
+    coords_buffer: torch.Tensor | None
+    vis_buffer: torch.Tensor | None
+    conf_buffer: torch.Tensor | None
+    corr_embs_buffer: torch.Tensor | None
+    ema_flow_buffer: torch.Tensor | None
+    track_feat_cache: list[torch.Tensor | None]
+
+    def reset(self) -> None: ...
+
+    def __call__(
+        self, frame: torch.Tensor, queries: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
 class ManagedLiteTracker(torch.nn.Module):
@@ -14,7 +34,7 @@ class ManagedLiteTracker(torch.nn.Module):
     retain LiteTracker's tuple/shapes and follow the current ``track_ids``.
 
     Lifecycle decisions are Python-side, outside a future exported neural graph.
-    Cache surgery is isolated below and currently supports the PyTorch backend.
+    Cache operations below support tensor-backed PyTorch and hybrid ONNX backends.
     Queries cannot be deleted within a session, including while invisible.
     start_keyframe() replaces the whole session at the last processed image.
     Set device/eval mode before starting; use reset() explicitly for a new video.
@@ -28,7 +48,7 @@ class ManagedLiteTracker(torch.nn.Module):
         "ema_flow_buffer",
     )
 
-    def __init__(self, model: LiteTracker, max_points: int = 512):
+    def __init__(self, model: TrackerBackend, max_points: int = 512):
         super().__init__()
         if model.online_ind != 0:
             raise ValueError("Use a fresh or reset LiteTracker instance.")

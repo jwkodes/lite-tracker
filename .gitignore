@@ -208,3 +208,6 @@ __marimo__/
 
 *.pth
 results/
+
+# Local checkpoints and exported model bundles
+/weights/

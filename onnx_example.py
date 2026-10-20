@@ -1,23 +1,32 @@
 """
 Example for exporting LiteTracker sub-components to ONNX format and using with a wrapper.
-Please note that there might be discrepancies between the PyTorch and ONNX wrapper. Please verify carefully for your use case.
+The three neural components use ONNX Runtime; preprocessing and state still use
+CPU PyTorch. ManagedLiteTracker supplies stable IDs and keyframe session handovers.
 
 Usage:
     # Export only:
-    uv run onnx_example.py --checkpoint path/to/weights.pth --output_dir ./onnx_export
+    uv run onnx_example.py --checkpoint path/to/weights.pth --output_dir weights/onnx_managed
 
     # Export + verify against PyTorch:
-    uv run onnx_example.py --checkpoint path/to/weights.pth --output_dir ./onnx_export --verify
+    uv run onnx_example.py --checkpoint path/to/weights.pth --output_dir weights/onnx_managed --verify
 """
 
-import os
 import argparse
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from src.lite_tracker import LiteTracker, posenc
-from src.model_utils import sample_features5d, bilinear_sampler
+from src.managed_lite_tracker import ManagedLiteTracker
+from src.model_utils import (
+    bilinear_sampler,
+    get_1d_sincos_pos_embed_from_grid,
+    sample_features5d,
+)
 
 
 def load_model(checkpoint_path: str) -> LiteTracker:
@@ -32,7 +41,7 @@ def load_model(checkpoint_path: str) -> LiteTracker:
     """
     model = LiteTracker()
     with open(checkpoint_path, "rb") as f:
-        state_dict = torch.load(f, map_location="cpu")
+        state_dict = torch.load(f, map_location="cpu", weights_only=True)
         if "model" in state_dict:
             state_dict = state_dict["model"]
     model.load_state_dict(state_dict)
@@ -43,6 +52,7 @@ def load_model(checkpoint_path: str) -> LiteTracker:
 # ---------------------------------------------------------------------------
 # Export functions
 # ---------------------------------------------------------------------------
+
 
 def export_fnet(model: LiteTracker, output_dir: str, opset_version: int = 17):
     """
@@ -68,6 +78,7 @@ def export_fnet(model: LiteTracker, output_dir: str, opset_version: int = 17):
         dummy_input,
         output_path,
         opset_version=opset_version,
+        dynamo=False,
         input_names=["frame"],
         output_names=["features"],
         dynamic_axes={
@@ -104,6 +115,7 @@ def export_corr_mlp(model: LiteTracker, output_dir: str, opset_version: int = 17
         dummy_input,
         output_path,
         opset_version=opset_version,
+        dynamo=False,
         input_names=["corr_volume"],
         output_names=["corr_emb"],
         dynamic_axes={
@@ -141,6 +153,7 @@ def export_updateformer(model: LiteTracker, output_dir: str, opset_version: int 
         (dummy_input, dummy_mask),
         output_path,
         opset_version=opset_version,
+        dynamo=False,
         input_names=["input_tensor", "mask"],
         output_names=["delta"],
         dynamic_axes={
@@ -175,6 +188,25 @@ def export_all(model: LiteTracker, output_dir: str, opset_version: int = 17):
         "corr_mlp": export_corr_mlp(model, output_dir, opset_version),
         "updateformer": export_updateformer(model, output_dir, opset_version),
     }
+    config = {
+        name: getattr(model, name)
+        for name in (
+            "window_len",
+            "stride",
+            "corr_radius",
+            "corr_levels",
+            "model_resolution",
+            "iters",
+            "input_dim",
+            "latent_dim",
+            "inv_sigmoid_true_val",
+        )
+    }
+    config["format_version"] = 1
+    Path(output_dir, "tracker_config.json").write_text(
+        json.dumps(config, indent=2) + "\n"
+    )
+    np.save(Path(output_dir, "time_emb.npy"), model.time_emb.detach().cpu().numpy())
     print("Export complete!")
     return paths
 
@@ -182,6 +214,7 @@ def export_all(model: LiteTracker, output_dir: str, opset_version: int = 17):
 # ---------------------------------------------------------------------------
 # ONNX-based LiteTracker wrapper
 # ---------------------------------------------------------------------------
+
 
 class OnnxLiteTracker:
     """
@@ -193,7 +226,7 @@ class OnnxLiteTracker:
     numpy/torch.
 
     Usage:
-        tracker = OnnxLiteTracker("./onnx_export")
+        tracker = OnnxLiteTracker("weights/onnx_managed")
         for frame in video_frames:
             coords, vis, conf = tracker(frame_tensor, queries_tensor)
     """
@@ -201,62 +234,99 @@ class OnnxLiteTracker:
     def __init__(
         self,
         onnx_dir: str,
-        window_len: int = 16,
-        stride: int = 4,
-        corr_radius: int = 3,
-        corr_levels: int = 4,
-        model_resolution: tuple = (384, 512),
-        iters: int = 1,
-        input_dim: int = 1110,
-        latent_dim: int = 128,
-        providers: list = None,
+        window_len: int | None = None,
+        stride: int | None = None,
+        corr_radius: int | None = None,
+        corr_levels: int | None = None,
+        model_resolution: tuple | None = None,
+        iters: int | None = None,
+        input_dim: int | None = None,
+        latent_dim: int | None = None,
+        providers: list | None = None,
+        *,
+        threads: int = 2,
     ):
-        """
-        Initialize the ONNX-based LiteTracker.
+        """Load the original three-graph export or a new export with metadata.
 
-        Args:
-            onnx_dir (str): Directory containing the exported ONNX models.
-            window_len (int): Max length of the temporal window for tracking.
-            stride (int): Stride scale for feature extraction.
-            corr_radius (int): Radius for correlation computation.
-            corr_levels (int): Number of correlation pyramid levels.
-            model_resolution (tuple): Resolution to which input frames are resized; (H, W).
-            iters (int): Number of update iterations per frame.
-            input_dim (int): Dimension of the transformer input tokens.
-            latent_dim (int): Dimension of the feature encoder output channels.
-            providers (list): ONNX Runtime execution providers. Defaults to CUDA + CPU.
+        Original positional/keyword arguments remain supported. Omitted settings
+        come from export metadata when present, otherwise from the original
+        defaults. Explicit settings must agree with metadata to avoid silent
+        mismatches. Neural components use ONNX Runtime; host state and sampling
+        still use CPU PyTorch tensors. Mac defaults to CPU, CUDA when available.
         """
         import onnxruntime as ort
 
+        defaults = {
+            "window_len": 16,
+            "stride": 4,
+            "corr_radius": 3,
+            "corr_levels": 4,
+            "model_resolution": (384, 512),
+            "iters": 1,
+            "input_dim": 1110,
+            "latent_dim": 128,
+        }
+        requested = {
+            "window_len": window_len,
+            "stride": stride,
+            "corr_radius": corr_radius,
+            "corr_levels": corr_levels,
+            "model_resolution": model_resolution,
+            "iters": iters,
+            "input_dim": input_dim,
+            "latent_dim": latent_dim,
+        }
+        config_path = Path(onnx_dir, "tracker_config.json")
+        config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        if config and config.get("format_version") != 1:
+            raise ValueError("Unsupported tracker export format; re-export the model.")
+        for name, default in defaults.items():
+            exported = config.get(name, default)
+            value = requested[name]
+            if name == "model_resolution":
+                exported = tuple(exported)
+                value = tuple(value) if value is not None else None
+            if config and value is not None and value != exported:
+                raise ValueError(f"{name} does not match the exported configuration.")
+            setattr(self, name, exported if value is None else value)
+        self.inv_sigmoid_true_val = config.get("inv_sigmoid_true_val", 4.6)
         if providers is None:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-
-        self.window_len = window_len
-        self.stride = stride
-        self.corr_radius = corr_radius
-        self.corr_levels = corr_levels
-        self.model_resolution = model_resolution
-        self.iters = iters
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-        self.inv_sigmoid_true_val = 4.6
-
-        # Load ONNX sessions
-        self.fnet_session = ort.InferenceSession(
-            os.path.join(onnx_dir, "fnet.onnx"), providers=providers
-        )
-        self.corr_mlp_session = ort.InferenceSession(
-            os.path.join(onnx_dir, "corr_mlp.onnx"), providers=providers
-        )
-        self.updateformer_session = ort.InferenceSession(
-            os.path.join(onnx_dir, "updateformer.onnx"), providers=providers
-        )
-
-        # Precompute time embedding (same as LiteTracker.__init__)
-        from src.model_utils import get_1d_sincos_pos_embed_from_grid
-        time_grid = torch.linspace(0, window_len - 1, window_len).reshape(1, window_len, 1)
-        self.time_emb = get_1d_sincos_pos_embed_from_grid(input_dim, time_grid[0])
-
+            providers = [
+                p
+                for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                if p in ort.get_available_providers()
+            ]
+        if threads < 1:
+            raise ValueError("threads must be positive.")
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = threads
+        options.inter_op_num_threads = 1
+        for name in ("fnet", "corr_mlp", "updateformer"):
+            setattr(
+                self,
+                name + "_session",
+                ort.InferenceSession(
+                    str(Path(onnx_dir, name + ".onnx")),
+                    sess_options=options,
+                    providers=providers,
+                ),
+            )
+        if config:
+            self.time_emb = torch.from_numpy(
+                np.load(Path(onnx_dir, "time_emb.npy"), allow_pickle=False)
+            )
+        else:
+            # Legacy export folders contain only the three ONNX files.
+            time_grid = torch.linspace(0, self.window_len - 1, self.window_len).reshape(
+                1, self.window_len, 1
+            )
+            self.time_emb = get_1d_sincos_pos_embed_from_grid(
+                self.input_dim, time_grid[0]
+            )
+        if self.time_emb.shape != (1, self.window_len, self.input_dim):
+            raise ValueError(
+                "Time embedding does not match the exported configuration."
+            )
         self.reset()
 
     def reset(self):
@@ -284,9 +354,7 @@ class OnnxLiteTracker:
         Returns:
             torch.Tensor: Feature map of shape [B, latent_dim, H//stride, W//stride].
         """
-        result = self.fnet_session.run(
-            None, {"frame": frame.numpy()}
-        )
+        result = self.fnet_session.run(None, {"frame": frame.numpy()})
         return torch.from_numpy(result[0])
 
     def _run_corr_mlp(self, corr_volume: torch.Tensor) -> torch.Tensor:
@@ -299,9 +367,7 @@ class OnnxLiteTracker:
         Returns:
             torch.Tensor: Correlation embeddings of shape [N_points, 256].
         """
-        result = self.corr_mlp_session.run(
-            None, {"corr_volume": corr_volume.numpy()}
-        )
+        result = self.corr_mlp_session.run(None, {"corr_volume": corr_volume.numpy()})
         return torch.from_numpy(result[0])
 
     def _run_updateformer(
@@ -393,7 +459,10 @@ class OnnxLiteTracker:
             tuple: (central track features, all support track features).
         """
         sample_coords = torch.cat(
-            [torch.zeros_like(queried_coords[..., :1][:, None]), queried_coords[:, None]],
+            [
+                torch.zeros_like(queried_coords[..., :1][:, None]),
+                queried_coords[:, None],
+            ],
             dim=-1,
         )
         support_points = self._get_support_points(sample_coords, support_radius)
@@ -430,6 +499,7 @@ class OnnxLiteTracker:
             0, 1, 3, 4, 5, 2
         )
 
+    @torch.no_grad()
     def __call__(self, frame: torch.Tensor, queries: torch.Tensor):
         """
         Predict tracks for the given frame and queries.
@@ -449,6 +519,10 @@ class OnnxLiteTracker:
                 vis (torch.Tensor): Predicted visibility mask [B, 1, N].
                 conf (torch.Tensor): Predicted confidence [B, 1, N].
         """
+        if frame.device.type != "cpu" or queries.device.type != "cpu":
+            raise ValueError("This hybrid ONNX backend requires CPU input tensors.")
+        if frame.dtype != torch.float32 or queries.dtype != torch.float32:
+            raise ValueError("This ONNX export requires float32 frames and queries.")
         original_shape = frame.shape
         frame = F.interpolate(
             frame, size=self.model_resolution, mode="bilinear", align_corners=True
@@ -461,7 +535,7 @@ class OnnxLiteTracker:
             original_shape[2] - 1
         )  # H
 
-        B, C, H, W = frame.shape
+        B, _C, H, W = frame.shape
         B, N, __ = queries_scaled.shape
         frame = 2 * (frame / 255.0) - 1.0
 
@@ -694,9 +768,7 @@ class OnnxLiteTracker:
                     B * num_new_frames * N, r * r * r * r
                 ).float()
                 corr_embs_list.append(self._run_corr_mlp(corr_flat))
-            corr_embs = torch.cat(corr_embs_list, dim=-1).view(
-                B, num_new_frames, N, -1
-            )
+            corr_embs = torch.cat(corr_embs_list, dim=-1).view(B, num_new_frames, N, -1)
 
             # If it is the first time step, we skip the transformer as there is nothing
             # to compute, simply use the computed `corr_embs` as well as the initial
@@ -783,9 +855,7 @@ class OnnxLiteTracker:
             self.coords_buffer = torch.cat([self.coords_buffer, coords], dim=1)
             self.vis_buffer = torch.cat([self.vis_buffer, vis], dim=1)
             self.conf_buffer = torch.cat([self.conf_buffer, conf], dim=1)
-            self.corr_embs_buffer = torch.cat(
-                [self.corr_embs_buffer, corr_embs], dim=1
-            )
+            self.corr_embs_buffer = torch.cat([self.corr_embs_buffer, corr_embs], dim=1)
 
         if current_window_size == self.window_len:
             self.coords_buffer = self.coords_buffer[:, 1:]
@@ -803,129 +873,206 @@ class OnnxLiteTracker:
 # Verification
 # ---------------------------------------------------------------------------
 
-def verify_export(checkpoint_path: str, onnx_dir: str, num_frames: int = 5):
+
+def verify_export(checkpoint_path: str, onnx_dir: str, num_frames: int = 36):
+    """Exercise ManagedLiteTracker with both backends, failing on any mismatch.
+
+    Uses the same externally chosen queries/events in both runs to isolate backend
+    equivalence. Checks dynamic query counts, future births, rolling history,
+    keyframe priming, empty sessions, and a fresh video reset. This is numerical
+    equivalence testing, not an accuracy benchmark or independent policy comparison.
     """
-    Verify ONNX export by comparing outputs against PyTorch model.
-
-    Runs both models on identical synthetic inputs and checks numerical agreement.
-    Uses a tolerance of 1e-2 for coordinate and confidence comparisons to account
-    for floating-point differences between PyTorch and ONNX Runtime backends.
-
-    Args:
-        checkpoint_path (str): Path to the LiteTracker checkpoint (.pth).
-        onnx_dir (str): Directory containing the exported ONNX models.
-        num_frames (int): Number of synthetic frames to test. Defaults to 5.
-
-    Returns:
-        bool: True if all frames pass verification, False otherwise.
-    """
-    print("\nVerifying ONNX export against PyTorch...")
-
-    # Load PyTorch model
+    torch.set_num_threads(2)
     pt_model = load_model(checkpoint_path)
-    pt_model.eval()
-
-    # Create ONNX tracker
-    onnx_tracker = OnnxLiteTracker(onnx_dir, providers=["CPUExecutionProvider"])
-
-    # Create synthetic inputs
-    B, C, H, W = 1, 3, 480, 640
-    N = 10
-    torch.manual_seed(42)
-    frames = [
-        torch.randint(0, 255, (B, C, H, W), dtype=torch.float32)
-        for _ in range(num_frames)
-    ]
-    queries = torch.cat(
-        [
-            torch.zeros(B, N, 1),  # all queries start at frame 0
-            torch.rand(B, N, 1) * (W - 1),
-            torch.rand(B, N, 1) * (H - 1),
-        ],
-        dim=2,
-    )
-
-    # Run both models
-    pt_model.reset()
-    onnx_tracker.reset()
-
-    max_coord_diff = 0.0
-    max_conf_diff = 0.0
-    all_passed = True
-
-    for i, frame in enumerate(frames):
-        with torch.no_grad():
-            pt_coords, pt_vis, pt_conf = pt_model(frame, queries)
-
-        onnx_coords, onnx_vis, onnx_conf = onnx_tracker(frame, queries)
-
-        coord_diff = (pt_coords.float() - onnx_coords.float()).abs().max().item()
-        conf_diff = (pt_conf.float() - onnx_conf.float()).abs().max().item()
-        vis_match = (pt_vis == onnx_vis).all().item()
-
-        max_coord_diff = max(max_coord_diff, coord_diff)
-        max_conf_diff = max(max_conf_diff, conf_diff)
-
-        # Use a reasonable tolerance for float32 comparisons
-        coord_ok = coord_diff < 1e-2
-        conf_ok = conf_diff < 1e-2
-
-        status = "PASS" if (coord_ok and conf_ok) else "FAIL"
-        if status == "FAIL":
-            all_passed = False
+    onnx_model = OnnxLiteTracker(onnx_dir, providers=["CPUExecutionProvider"])
+    for name in (
+        "window_len",
+        "stride",
+        "corr_radius",
+        "corr_levels",
+        "model_resolution",
+        "iters",
+    ):
+        if getattr(pt_model, name) != getattr(onnx_model, name):
+            raise ValueError(f"Export configuration mismatch: {name}")
+    boundary = pt_model.window_len + 4
+    if num_frames < 1:
+        raise ValueError("num_frames must be positive.")
+    full_lifecycle = num_frames >= boundary + 3
+    if not full_lifecycle:
         print(
-            f"  Frame {i}: {status} | "
-            f"coord_diff={coord_diff:.6f}, conf_diff={conf_diff:.6f}, vis_match={vis_match}"
+            f"Short verification: use at least {boundary + 3} frames to include a keyframe handover."
+        )
+    pt = ManagedLiteTracker(pt_model, max_points=24)
+    ort = ManagedLiteTracker(onnx_model, max_points=24)
+    generator = torch.Generator().manual_seed(42)
+    base = torch.randint(0, 256, (1, 3, 480, 640), generator=generator).float()
+    points = torch.tensor(
+        [[[x, y] for y in (150.0, 300.0) for x in (180.0, 250.0, 320.0, 390.0, 460.0)]]
+    )
+    queries = torch.cat((torch.zeros_like(points[..., :1]), points), dim=2)
+    report = {
+        "passed": True,
+        "full_lifecycle_coverage": full_lifecycle,
+        "provider": "CPUExecutionProvider",
+        "coordinate_atol_pixels": 0.01,
+        "confidence_atol": 0.001,
+        "max_coordinate_error": 0.0,
+        "max_confidence_error": 0.0,
+        "visibility_mismatches": 0,
+        "checks": [],
+        "events": [],
+    }
+
+    def compare(label, actual, expected):
+        finite = all(torch.isfinite(x).all().item() for x in (*actual, *expected))
+        coordinate_error = (
+            (actual[0] - expected[0]).abs().max().item() if actual[0].numel() else 0.0
+        )
+        confidence_error = (
+            (actual[2] - expected[2]).abs().max().item() if actual[2].numel() else 0.0
+        )
+        mismatches = (actual[1] != expected[1]).sum().item()
+        state_matches = (
+            pt.track_ids == ort.track_ids
+            and pt.frame_index == ort.frame_index
+            and pt.session_index == ort.session_index
+            and pt_model.online_ind == onnx_model.online_ind
+        )
+        history_matches = (
+            all(
+                getattr(pt_model, name).shape == getattr(onnx_model, name).shape
+                for name in pt._CACHES
+            )
+            if pt_model.online_ind
+            else True
+        )
+        ok = (
+            finite
+            and coordinate_error <= report["coordinate_atol_pixels"]
+            and confidence_error <= report["confidence_atol"]
+            and mismatches == 0
+            and state_matches
+            and history_matches
+        )
+        report["passed"] &= ok
+        report["max_coordinate_error"] = max(
+            report["max_coordinate_error"], coordinate_error
+        )
+        report["max_confidence_error"] = max(
+            report["max_confidence_error"], confidence_error
+        )
+        report["visibility_mismatches"] += mismatches
+        report["checks"].append(
+            {
+                "label": label,
+                "passed": ok,
+                "points": len(pt.track_ids),
+                "coordinate_error": coordinate_error,
+                "confidence_error": confidence_error,
+                "visibility_mismatches": mismatches,
+            }
+        )
+        print(
+            f"{label}: {'PASS' if ok else 'FAIL'} | {len(pt.track_ids)} points | "
+            f"xy error={coordinate_error:.6f}px | confidence error={confidence_error:.6f} | "
+            f"visibility mismatches={mismatches}",
+            flush=True,
         )
 
-    print(f"\n  Max coord diff: {max_coord_diff:.6f}")
-    print(f"  Max conf diff:  {max_conf_diff:.6f}")
+    for i in range(num_frames):
+        frame = base.roll(shifts=(i // 2, i), dims=(-2, -1))
+        if i == 3:
+            new_queries = torch.tensor([[[5.0, 220.0, 200.0], [5.0, 420.0, 240.0]]])
+            pt_ids = pt.add_queries(new_queries)
+            ort_ids = ort.add_queries(new_queries)
+            if pt_ids != ort_ids:
+                raise AssertionError("Backend query IDs differ after insertion.")
+            report["events"].append(
+                {"frame": i, "kind": "append_future_queries", "birth_frame": 5}
+            )
+        actual = pt(frame, queries if i == 0 else None)
+        expected = ort(frame, queries if i == 0 else None)
+        compare(f"frame_{i}", actual, expected)
+        if i == boundary and full_lifecycle:
+            carry = []
+            for j, tid in enumerate(pt.track_ids):
+                valid = all(
+                    out[1][0, 0, j].item()
+                    and torch.isfinite(out[0][0, 0, j]).all().item()
+                    and (out[0][0, 0, j] >= 0).all().item()
+                    and out[0][0, 0, j, 0] < 640
+                    and out[0][0, 0, j, 1] < 480
+                    for out in (actual, expected)
+                )
+                if valid:
+                    carry.append(tid)
+            carry = carry[:4]
+            if not carry:
+                raise RuntimeError(
+                    "No common visible points to exercise keyframe ID carryover."
+                )
+            new_points = torch.tensor(
+                [[[240.0, 180.0], [350.0, 260.0], [440.0, 320.0]]]
+            )
+            compare(
+                "keyframe_prime",
+                pt.start_keyframe(carry, new_points),
+                ort.start_keyframe(carry, new_points),
+            )
+            report["events"].append(
+                {"frame": i, "kind": "keyframe", "carried_ids": carry}
+            )
+    compare("empty_boundary", pt.start_keyframe([]), ort.start_keyframe([]))
+    compare("empty_frame", pt(base), ort(base))
+    new_queries = torch.tensor([[[float(pt.frame_index), 320.0, 240.0]]])
+    pt_ids = pt.add_queries(new_queries)
+    ort_ids = ort.add_queries(new_queries)
+    if pt_ids != ort_ids:
+        raise AssertionError("Backend query IDs differ after empty session.")
+    compare("after_empty", pt(base), ort(base))
+    pt.reset()
+    ort.reset()
+    compare("new_video", pt(base, queries[:, :3]), ort(base, queries[:, :3]))
+    path = Path("results") / Path(onnx_dir).resolve().name / "verification.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"Verification report: {path.resolve()}")
+    return report["passed"]
 
-    if all_passed:
-        print("\n  ✓ All frames passed verification!")
-    else:
-        print(
-            "\n  ✗ Some frames exceeded tolerance. This may be due to floating-point "
-            "differences between PyTorch and ONNX Runtime. Consider increasing tolerance "
-            "or ensuring consistent dtypes."
-        )
 
-    return all_passed
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Export LiteTracker sub-components to ONNX format."
-    )
-    parser.add_argument(
-        "-w", "--checkpoint",
-        required=True,
-        help="Path to LiteTracker checkpoint (.pth)",
-    )
-    parser.add_argument(
-        "-o", "--output_dir",
-        default="./onnx_export",
-        help="Output directory for ONNX models (default: ./onnx_export)",
-    )
-    parser.add_argument(
-        "--opset",
-        type=int,
-        default=17,
-        help="ONNX opset version (default: 17)",
-    )
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-w", "--checkpoint", required=True)
+    parser.add_argument("-o", "--output_dir", default="weights/onnx_managed")
+    parser.add_argument("--opset", type=int, default=17)
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Run verification after export (compares PyTorch vs ONNX outputs)",
+        help="Verify managed query lifecycle against PyTorch.",
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Verify an existing export without exporting again.",
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=36,
+        help="Verification frames; at least 23 for a handover with the default model.",
     )
     args = parser.parse_args()
+    torch.set_num_threads(2)
+    if not args.verify_only:
+        model = load_model(args.checkpoint)
+        export_all(model, args.output_dir, opset_version=args.opset)
+        del model
+    if (args.verify or args.verify_only) and not verify_export(
+        args.checkpoint, args.output_dir, args.num_frames
+    ):
+        raise SystemExit(1)
 
-    model = load_model(args.checkpoint)
-    export_all(model, args.output_dir, opset_version=args.opset)
 
-    if args.verify:
-        verify_export(args.checkpoint, args.output_dir)
+if __name__ == "__main__":
+    main()
