@@ -134,12 +134,16 @@ class LogExecutionTime:
         # Synchronize before starting the timer if using CUDA
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif torch.backends.mps.is_available():
+            torch.mps.synchronize()
         self.start_time = time.perf_counter()
 
     def __exit__(self, exc_type, exc_value, traceback):
         # Synchronize again after the code block finishes
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        elif torch.backends.mps.is_available():
+            torch.mps.synchronize()
         end_time = time.perf_counter()
         delta_time = end_time - self.start_time  # Execution time in seconds
         delta_time = delta_time * 1000  # Convert to milliseconds

@@ -1,4 +1,10 @@
 import os
+from contextlib import nullcontext
+
+# LiteTracker uses 3D grid sampling, which PyTorch 2.7.1 cannot run on MPS.
+# Keep supported operations on MPS and allow this operation to use CPU.
+# This must be set before importing torch; preserve explicit user settings.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch
 import argparse
 import imageio.v3 as iio
@@ -84,10 +90,12 @@ if __name__ == "__main__":
     num_frames, _ = count_frames_and_secs(args.video_path)
     print(f"Total frames in the video: {num_frames}")
 
-    with torch.autocast(
-        device_type="cuda",
-        dtype=dtype,
-        enabled=True,
+    # Use mixed precision only on CUDA GPUs that support BF16.
+    # MPS and CPU run in float32 without entering a CUDA context.
+    with (
+        torch.autocast(device_type="cuda", dtype=dtype)
+        if device == "cuda" and dtype == torch.bfloat16
+        else nullcontext()
     ):
         # Iterating over video frames, processing one window at a time:
         for i, frame in tqdm(

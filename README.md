@@ -19,6 +19,25 @@ uv sync
    - [SuPer Framework website](https://sites.google.com/ucsd.edu/super-framework/) and [dataset](https://drive.google.com/open?id=1fRepcpd9tFpRoi2G7G-w9uwo7eScG9LI)
 
 
+### Developing on macOS
+
+Use Python 3.12 with the pinned dependencies:
+
+```bash
+uv sync --python 3.12
+```
+
+The demo selects Apple MPS when available, otherwise CPU, and runs in float32.
+PyTorch 2.7.1 lacks MPS support for the tracker's 3D grid sampling operation.
+The demo enables CPU fallback for unsupported MPS operations before importing
+PyTorch; supported operations still use MPS. For your own scripts, launch with
+`PYTORCH_ENABLE_MPS_FALLBACK=1 uv run your_script.py`, or use `device="cpu"`.
+MPS timing synchronizes pending GPU work before and after each measured call.
+NVIDIA CUDA libraries and Triton are installed only on Linux x86_64; the existing
+CUDA dependency versions are preserved there. ONNX Runtime uses the GPU package
+on Linux x86_64 and the standard package on macOS. CUDA BF16 acceleration is
+used only on compatible NVIDIA GPUs.
+
 ## Inference and Evaluation
 ### Demo and runtime analysis
 The demo script runs LiteTracker on a video in a stream-line fashion, produces a video with tracking results, and prints the runtime statistics.
