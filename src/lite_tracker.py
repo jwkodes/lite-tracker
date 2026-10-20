@@ -12,6 +12,7 @@ This module provides:
 
 Dependencies: torch, torch.nn, torch.nn.functional, src.model_utils, src.model_blocks
 """
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
